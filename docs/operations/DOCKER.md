@@ -17,7 +17,10 @@ and the runtime stage is `alpine:3.21` with a dedicated `kuttidb` user
 
 Official multi-arch images (`linux/amd64`, `linux/arm64`) are published to
 GitHub Container Registry on the same `v*` tags as binary releases by
-[`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml):
+[`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml).
+The workflow always targets `ghcr.io/<owner>/<repo>` for the repository that
+runs it (lowercase `GITHUB_REPOSITORY`), so a fork publishes under its own
+GHCR namespace. Upstream `kuttidb/kuttidb` publishes:
 
 | Tag | Meaning |
 |---|---|
@@ -34,8 +37,8 @@ docker run --rm -p 127.0.0.1:7379:7379 \
 Re-publishing an existing version tag is unsupported — cut a new patch tag
 instead (same policy as binaries; see [RELEASE.md](RELEASE.md)). After the
 first publish, set the GHCR package visibility to **public** if anonymous
-pulls are required (one-time GitHub UI setting on the `kuttidb/kuttidb`
-package).
+pulls are required (one-time GitHub UI setting on the package for that
+repository, e.g. `kuttidb/kuttidb` upstream).
 
 Local contributor workflows may keep building `kuttidb:local` via Compose;
 use the GHCR image for deployed / released runs.
