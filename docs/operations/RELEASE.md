@@ -2,7 +2,10 @@
 
 How official KuttiDB binaries are built, tested, and published. The pipeline
 lives in [`.github/workflows/release.yml`](../../.github/workflows/release.yml)
-and is fully tag-driven: a tag is the release.
+and is fully tag-driven: a tag is the release. The container image is
+published by
+[`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml)
+on the same `v*` tags.
 
 Client SDK packages (PyPI, npm, crates.io, the Go module) are released
 separately with their own language-prefixed tag scheme — see
@@ -103,7 +106,8 @@ gh workflow run release.yml
 ```
 
 Artifacts appear on the workflow run; no GitHub Release is created. Use this
-when touching the build, packaging, or the workflow itself.
+when touching the build, packaging, or the workflow itself. For the container
+image dry-run, see [Container image (GHCR)](#container-image-ghcr) below.
 
 ## Release artifacts
 
@@ -124,6 +128,22 @@ source:
   `--telemetry off` always disable it. This is the variant the installer
   ships when a user accepts the community-telemetry opt-in question
   (see [TELEMETRY.md](../guides/TELEMETRY.md)).
+
+### Container image (GHCR)
+
+The same `v*` tag also triggers
+[`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml),
+which publishes:
+
+- `ghcr.io/kuttidb/kuttidb:<version>` — multi-arch (`linux/amd64`, `linux/arm64`), Alpine `TLS=0` image from the repo `Dockerfile`
+- `ghcr.io/kuttidb/kuttidb:latest` — only for stable tags (no hyphen in the tag name)
+
+Dry run: Actions tab → *Release Docker image (GHCR)* → *Run workflow*, or
+`gh workflow run release-docker.yml`. The pipeline builds multi-arch but does
+**not** push version or `latest` tags to GHCR.
+
+After first publish, make the GHCR package public if anonymous pulls are
+desired. Do not re-publish an existing version; bump and cut a new tag.
 
 Both variants contain:
 

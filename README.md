@@ -308,6 +308,7 @@ KUTTIDB_AUTH_TOKEN_FILE=./auth.token docker compose up --build
 The compose file starts a non-root container with durable WALs, loopback-only
 ports, and a Prometheus metrics listener. Multi-architecture images cover
 `linux/amd64` and `linux/arm64`.
+Released multi-arch images: `ghcr.io/kuttidb/kuttidb:<version>` (see [DOCKER.md](docs/operations/DOCKER.md)).
 
 [Docker setup](docs/operations/DOCKER.md) ·
 [Kubernetes manifests](docs/operations/KUBERNETES.md) ·
