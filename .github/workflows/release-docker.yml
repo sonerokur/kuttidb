@@ -1,0 +1,88 @@
+# Builds and publishes the official KuttiDB container image to GHCR.
+#
+# Trigger: push a v* tag to publish ghcr.io/kuttidb/kuttidb:<version>
+# (and :latest when the tag has no hyphen), or workflow_dispatch for a
+# dry run — Buildx still builds multi-arch, but nothing is pushed.
+#
+# Process docs: docs/operations/DOCKER.md, docs/operations/RELEASE.md
+name: Release Docker image (GHCR)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Derive release version and tags
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Push only on tag push. Dry-run must not publish release tags.
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            TAGS="ghcr.io/kuttidb/kuttidb:${VERSION}"
+            # Stable = no hyphen in the git tag name (matches release.yml prerelease rule).
+            if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+              TAGS="${TAGS},ghcr.io/kuttidb/kuttidb:latest"
+            fi
+            echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "tags=ghcr.io/kuttidb/kuttidb:${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=KuttiDB
+            org.opencontainers.image.description=Minimal Alpine KuttiDB network server (TLS=0)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0

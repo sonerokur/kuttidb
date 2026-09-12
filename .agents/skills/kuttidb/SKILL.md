@@ -577,6 +577,16 @@ the console gateway's memory for the browser session.
 
 ## 8. Docker
 
+Published multi-arch image (same `v*` releases as binaries):
+
+```sh
+docker pull ghcr.io/kuttidb/kuttidb:<version>
+```
+
+Details and `docker run` flags: `docs/operations/DOCKER.md`.
+
+Local Compose (builds `kuttidb:local`):
+
 ```sh
 KUTTIDB_AUTH_TOKEN_FILE=./auth.token docker compose up --build
 ```

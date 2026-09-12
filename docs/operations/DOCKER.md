@@ -13,6 +13,33 @@ and the runtime stage is `alpine:3.21` with a dedicated `kuttidb` user
   them to a `0600` private path under the data directory before exec, because
   the server intentionally rejects group/other-readable auth files.
 
+## Published image (GHCR)
+
+Official multi-arch images (`linux/amd64`, `linux/arm64`) are published to
+GitHub Container Registry on the same `v*` tags as binary releases by
+[`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml):
+
+| Tag | Meaning |
+|---|---|
+| `ghcr.io/kuttidb/kuttidb:<version>` | Every release tag (leading `v` stripped), e.g. `0.1.0`, `0.1.0-beta.1` |
+| `ghcr.io/kuttidb/kuttidb:latest` | Updated only for stable tags (no hyphen in the git tag) |
+
+```sh
+docker pull ghcr.io/kuttidb/kuttidb:0.1.0
+docker run --rm -p 127.0.0.1:7379:7379 \
+  ghcr.io/kuttidb/kuttidb:0.1.0 \
+  7379 /var/lib/kuttidb/kuttidb.wal 100
+```
+
+Re-publishing an existing version tag is unsupported — cut a new patch tag
+instead (same policy as binaries; see [RELEASE.md](RELEASE.md)). After the
+first publish, set the GHCR package visibility to **public** if anonymous
+pulls are required (one-time GitHub UI setting on the `kuttidb/kuttidb`
+package).
+
+Local contributor workflows may keep building `kuttidb:local` via Compose;
+use the GHCR image for deployed / released runs.
+
 ## Atomic job completion in containers
 
 The image supports the full completion surface, including `TLS=0` builds (no
@@ -79,9 +106,11 @@ scraper instead. See [KUBERNETES.md](KUBERNETES.md).
 
 ## Multi-architecture
 
-CI builds `linux/amd64` and `linux/arm64` images via QEMU
-(`.github/workflows/ci.yml`, job `multiarch`) and smoke-tests the arm64
-variant. Publishing to a registry is release work, not part of CI.
+Release builds publish `linux/amd64` and `linux/arm64` as one manifest list
+via Buildx/QEMU in `release-docker.yml`. There is no separate PR-time
+`ci.yml` multiarch job in this tree; use `workflow_dispatch` on
+`release-docker.yml` to exercise the multi-arch build without pushing tags
+to GHCR.
 
 ## Compose example
 
