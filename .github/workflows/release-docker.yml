@@ -64,10 +64,14 @@ jobs:
           fi
 
       - name: Announce publish mode
+        env:
+          PUSH: ${{ steps.meta.outputs.push }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
-            echo "::notice::Publishing ${{ steps.meta.outputs.tags }} (push=true). Ensure Actions Workflow permissions allow packages: write."
+          # Pass PUSH/TAGS via env: — never interpolate tag-derived step outputs inside run:.
+          if [ "$PUSH" = "true" ]; then
+            echo "::notice::Publishing $TAGS (push=true). Ensure Actions Workflow permissions allow packages: write."
           else
             echo "::notice::Dry-run: not publishing to GHCR (push=false). Push a v* tag to publish ghcr.io/<owner>/<repo>; see docs/operations/DOCKER.md#publish-configuration."
           fi
