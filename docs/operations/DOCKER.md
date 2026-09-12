@@ -43,6 +43,31 @@ repository, e.g. `kuttidb/kuttidb` upstream).
 Local contributor workflows may keep building `kuttidb:local` via Compose;
 use the GHCR image for deployed / released runs.
 
+### Publish configuration
+
+`workflow_dispatch` (“Run workflow”) is a **dry-run**: it builds multi-arch
+but never logs in or pushes. To publish, push a `v*` tag (same as binaries).
+
+1. **Actions Workflow permissions** — Repository → *Settings* → *Actions* →
+   *General* → *Workflow permissions* → **Read and write permissions**, and
+   allow GitHub Actions to create packages if the UI offers that control.
+   The workflow requests `packages: write` on the job; org policies that
+   forbid package creation will still block the push.
+2. **Publish trigger** — Push an annotated tag, e.g.
+   `git tag -a v0.1.0 -m "…" && git push origin v0.1.0`. Confirm in the run
+   that *Log in to GitHub Container Registry* ran (not skipped) and the
+   job notice shows `push=true` for `ghcr.io/<owner>/<repo>`.
+3. **Package visibility (one-time)** — After the first successful tag
+   publish: GitHub → *Packages* → the `kuttidb` (or repo-named) container
+   package → *Package settings* → *Change visibility* → **Public** if
+   anonymous pulls are required.
+4. **Forks** — Images land under `ghcr.io/<your-login-or-org>/<repo>`, not
+   under `ghcr.io/kuttidb/kuttidb`. Upstream consumers keep pulling the
+   official coordinates above.
+
+If a dry-run succeeded but no package appeared, that is expected — cut and
+push a `v*` tag after this workflow is on the branch you tag from.
+
 ## Atomic job completion in containers
 
 The image supports the full completion surface, including `TLS=0` builds (no

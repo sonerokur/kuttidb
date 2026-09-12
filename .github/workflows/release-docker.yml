@@ -63,6 +63,15 @@ jobs:
             echo "tags=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Announce publish mode
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.meta.outputs.push }}" = "true" ]; then
+            echo "::notice::Publishing ${{ steps.meta.outputs.tags }} (push=true). Ensure Actions Workflow permissions allow packages: write."
+          else
+            echo "::notice::Dry-run: not publishing to GHCR (push=false). Push a v* tag to publish ghcr.io/<owner>/<repo>; see docs/operations/DOCKER.md#publish-configuration."
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

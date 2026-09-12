@@ -142,7 +142,10 @@ upstream `kuttidb/kuttidb` that is:
 
 Dry run: Actions tab → *Release Docker image (GHCR)* → *Run workflow*, or
 `gh workflow run release-docker.yml`. The pipeline builds multi-arch but does
-**not** push version or `latest` tags to GHCR.
+**not** push version or `latest` tags to GHCR. Publishing requires a `v*`
+tag push (not dispatch). For Actions *Workflow permissions*, `packages: write`,
+and the one-time public-package UI steps, see
+[DOCKER.md — Publish configuration](DOCKER.md#publish-configuration).
 
 After first publish, make the GHCR package public if anonymous pulls are
 desired. Do not re-publish an existing version; bump and cut a new tag.
