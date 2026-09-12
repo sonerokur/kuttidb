@@ -1,8 +1,10 @@
-# Builds and publishes the official KuttiDB container image to GHCR.
+# Builds and publishes the KuttiDB container image to GHCR for this repository.
 #
-# Trigger: push a v* tag to publish ghcr.io/kuttidb/kuttidb:<version>
+# Trigger: push a v* tag to publish ghcr.io/<owner>/<repo>:<version>
 # (and :latest when the tag has no hyphen), or workflow_dispatch for a
 # dry run — Buildx still builds multi-arch, but nothing is pushed.
+# Image path always follows github.repository (lowercase), so forks publish
+# under their own GHCR namespace; upstream kuttidb/kuttidb → ghcr.io/kuttidb/kuttidb.
 #
 # Process docs: docs/operations/DOCKER.md, docs/operations/RELEASE.md
 name: Release Docker image (GHCR)
@@ -35,6 +37,10 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
+          # GHCR requires lowercase; always target the repo that runs this workflow.
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
@@ -46,15 +52,15 @@ jobs:
           # Push only on tag push. Dry-run must not publish release tags.
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
             echo "push=true" >> "$GITHUB_OUTPUT"
-            TAGS="ghcr.io/kuttidb/kuttidb:${VERSION}"
+            TAGS="${IMAGE}:${VERSION}"
             # Stable = no hyphen in the git tag name (matches release.yml prerelease rule).
             if [[ "$GITHUB_REF_NAME" != *-* ]]; then
-              TAGS="${TAGS},ghcr.io/kuttidb/kuttidb:latest"
+              TAGS="${TAGS},${IMAGE}:latest"
             fi
             echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
           else
             echo "push=false" >> "$GITHUB_OUTPUT"
-            echo "tags=ghcr.io/kuttidb/kuttidb:${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "tags=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up QEMU
