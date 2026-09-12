@@ -124,14 +124,27 @@ endpoint; DNS names are never resolved.
 Telemetry settings are also allowlisted through `kuttidb ensure` and Python
 `ServerParams` as `telemetry`, `telemetry_endpoint`, and
 `telemetry_state_dir`; managed launches default the state path under `data_dir`.
-The reporter is built out by default, has no SDK/install/browser beacon, and
-samples only a bucket of open native connections after 15 minutes of readiness.
+The reporter is built out by default, has no SDK/browser beacon, and samples
+only a bucket of open native connections after 15 minutes of readiness. The
+official installer additionally sends one count-only `POST
+https://telemetry.kuttidb.com/v1/install` signal per run (body exactly
+`{"schema_version":1}` — no identifiers, device details, or telemetry answer),
+counted for Yes and No alike; `DO_NOT_TRACK=1` disables it and an unreachable
+collector never affects the install. Public v1 stats also carry a non-telemetry
+`clients` object: client-SDK download counts cached from public registry APIs
+(npm trailing-30-day daily sum, PyPI pypistats without_mirrors daily sum,
+crates.io trailing-month figure; Maven Central publishes none), refreshed
+every 6 hours and rendered stale after 48 hours without a good fetch.
 Official release tarballs come in two variants per platform: the plain
 `kuttidb-<version>-<os>-<arch>.tar.gz` is telemetry-free (reporter not
 compiled in), and `kuttidb-<version>-telemetry-<os>-<arch>.tar.gz` is
 telemetry-capable **with reporting on by default** (build flag
 `KUTTIDB_TELEMETRY_DEFAULT_ON`; `make TELEMETRY=1 TELEMETRY_DEFAULT=1`
-reproduces it). The `install.sh` community opt-in question selects the
+reproduces it). Both variants ship `kuttidb-cli` as a self-contained
+PyInstaller onefile binary (no `python3` at runtime; built per platform by
+`make kuttidb-cli-bin` — pinned Python 3.12 + `pyinstaller==6.22.2` in CI —
+with a live round-trip gate; the repo-root script stays the dev client).
+The `install.sh` community opt-in question selects the
 tarball; the opt-in build also writes `~/.config/kuttidb/telemetry.env`
 (`KUTTIDB_TELEMETRY=on`, private state dir) for shells and older binaries.
 Standalone servers resolve a default state dir under
