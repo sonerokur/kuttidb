@@ -133,7 +133,9 @@ source:
 
 The same `v*` tag also triggers
 [`.github/workflows/release-docker.yml`](../../.github/workflows/release-docker.yml),
-which publishes:
+which publishes to `ghcr.io/<owner>/<repo>` for the repository that runs the
+workflow (so forks can verify publish under their own GHCR package). From
+upstream `kuttidb/kuttidb` that is:
 
 - `ghcr.io/kuttidb/kuttidb:<version>` — multi-arch (`linux/amd64`, `linux/arm64`), Alpine `TLS=0` image from the repo `Dockerfile`
 - `ghcr.io/kuttidb/kuttidb:latest` — only for stable tags (no hyphen in the tag name)
