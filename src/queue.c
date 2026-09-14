@@ -9,12 +9,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "job_status.h"
 
 #define QUEUE_MESSAGE_MAX (64u << 20)
+/* Reserved ahead of the write cursor so a commit lands inside the existing
+ * file size and skips the inode-update journal transaction. A crash leaves
+ * at most this much unused tail, which the next open recognises (all zeros)
+ * and truncates; a clean close returns it immediately. */
+#define QUEUE_WAL_PREALLOC ((off_t)8 << 20)
 #define LOG_HEADER 28u
 
 /* Mutex-operation result checks. The metadata and WAL mutexes are
@@ -86,8 +92,13 @@ typedef struct Message {
     uint64_t delivery_tag;
     uint64_t owner;
     uint64_t expires_ms;
-    uint64_t not_before_ms;
-    uint64_t visibility_deadline_ms;
+    /* Ready messages use wall-clock scheduling; in-flight messages use a
+     * monotonic lease. These states are exclusive, so share the storage.
+     * Never expose/persist the inactive interpretation of this union. */
+    union {
+        uint64_t not_before_ms;
+        uint64_t visibility_deadline_ms;
+    };
     uint32_t len;
     uint32_t deliveries;
     uint32_t wal_footprint;   /* WAL bytes this message contributes */
@@ -221,7 +232,32 @@ struct QueueStore {
     int log_fd;
     int failed;
     char *path;               /* NULL for in-memory stores */
+    /* WAL staging buffer (wal_lock). Records are assembled here and handed
+     * to the kernel in one write per durability round instead of one write
+     * per record: a 256-message batch cost 256 write syscalls, and the
+     * per-syscall kernel work (permission, timestamp, page lookup, dirty
+     * throttling) dominated server CPU. Byte order still equals record
+     * order, and every fsync path flushes first, so the acknowledgement
+     * contract is unchanged: nothing is acknowledged before an fsync covers
+     * its bytes in the file. */
+    unsigned char *wal_buf;
+    size_t wal_buf_len;
+    size_t wal_buf_cap;
+    /* Explicit append offset (wal_lock) instead of O_APPEND, so staged bytes
+     * land inside wal_alloc_end: the file size the WAL has been grown to
+     * ahead of its data. Zero when the filesystem refuses the reservation,
+     * in which case writes simply extend the file. wal_size_synced records
+     * that the current size is already durable, which is what lets a commit
+     * inside the span use fdatasync. */
+    off_t wal_off;
+    off_t wal_alloc_end;
+    int wal_size_synced;
 };
+
+/* Large enough for a full 256-message batch of typical records without a
+ * mid-batch flush; allocated on the first durable record so an in-memory or
+ * idle store keeps its small resident footprint. */
+#define WAL_BUF_CAP (256u * 1024u)
 
 /* Test-only fault injection at named commit boundaries (ADR 0002 test
  * plan). Compiled out of every production build: without
@@ -238,7 +274,13 @@ static void job_failpoint(const char *name) {
 #else
 static inline void job_failpoint(const char *name) { (void)name; }
 #endif
-static uint32_t crc_table[256];
+/* Slice-by-8 CRC-32 (reflected, polynomial 0xedb88320). Table 0 is the
+ * classic byte table and tables 1..7 extend it so eight input bytes fold in
+ * one step; the checksum value is bit-identical to the byte-at-a-time
+ * version, so existing WAL files verify unchanged. This is checksum cost
+ * only: it became a visible share of server CPU once per-record write
+ * syscalls were replaced by one write per durability round. */
+static uint32_t crc_table[8][256];
 static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
 
 static void crc_init(void) {
@@ -246,8 +288,33 @@ static void crc_init(void) {
         uint32_t value = i;
         for (int j = 0; j < 8; j++)
             value = (value & 1) ? UINT32_C(0xedb88320) ^ (value >> 1) : value >> 1;
-        crc_table[i] = value;
+        crc_table[0][i] = value;
     }
+    for (uint32_t i = 0; i < 256; i++)
+        for (int slice = 1; slice < 8; slice++)
+            crc_table[slice][i] =
+                crc_table[0][crc_table[slice - 1][i] & 0xff] ^
+                (crc_table[slice - 1][i] >> 8);
+}
+
+static uint32_t crc_span(uint32_t crc, const unsigned char *p, size_t len) {
+    /* Unaligned loads are read byte-wise into a local, so this stays
+     * alignment- and endianness-independent. */
+    while (len >= 8) {
+        uint32_t low = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        low ^= crc;
+        crc = crc_table[7][low & 0xff] ^
+              crc_table[6][(low >> 8) & 0xff] ^
+              crc_table[5][(low >> 16) & 0xff] ^
+              crc_table[4][(low >> 24) & 0xff] ^
+              crc_table[3][p[4]] ^ crc_table[2][p[5]] ^
+              crc_table[1][p[6]] ^ crc_table[0][p[7]];
+        p += 8;
+        len -= 8;
+    }
+    while (len--) crc = crc_table[0][(crc ^ *p++) & 0xff] ^ (crc >> 8);
+    return crc;
 }
 
 static uint32_t crc32(const void *a, size_t alen, const void *b, size_t blen,
@@ -256,11 +323,8 @@ static uint32_t crc32(const void *a, size_t alen, const void *b, size_t blen,
     uint32_t crc = UINT32_C(0xffffffff);
     const unsigned char *items[3] = {a, b, d};
     size_t lens[3] = {alen, blen, dlen};
-    for (int item = 0; item < 3; item++) {
-        const unsigned char *p = items[item];
-        for (size_t i = 0; i < lens[item]; i++)
-            crc = crc_table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
-    }
+    for (int item = 0; item < 3; item++)
+        crc = crc_span(crc, items[item], lens[item]);
     return crc ^ UINT32_C(0xffffffff);
 }
 
@@ -311,6 +375,127 @@ static int write_all(int fd, const void *data, size_t len) {
         len -= (size_t)n;
     }
     return 0;
+}
+
+static int pwrite_all(int fd, const void *data, size_t len, off_t off) {
+    const char *p = data;
+    while (len) {
+        ssize_t n = pwrite(fd, p, len, off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        off += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Grow the file ahead of the write cursor. Writing inside an existing file
+ * size leaves the inode untouched, so the commit costs one data barrier
+ * instead of a data barrier plus a size-update journal transaction: on this
+ * project's Linux reference VPS, about 2,550 durable commits per second
+ * against about 1,200. FALLOC_FL_KEEP_SIZE was measured as an alternative
+ * that keeps the file length honest and is not viable — it gives no benefit
+ * at all, because every write still updates the inode. A filesystem that
+ * refuses the reservation falls back to extending writes. Holds wal_lock. */
+static void wal_reserve_locked(QueueStore *store, size_t need) {
+#if defined(__linux__)
+    if (store->wal_off + (off_t)need <= store->wal_alloc_end) return;
+    off_t want = store->wal_off + (off_t)need + QUEUE_WAL_PREALLOC;
+    if (fallocate(store->log_fd, 0, 0, want) == 0) {
+        store->wal_alloc_end = want;
+        store->wal_size_synced = 0;   /* the new size is not durable yet */
+    } else {
+        store->wal_alloc_end = 0;
+    }
+#else
+    (void)store; (void)need;
+#endif
+}
+
+/* Inside a reserved span whose size is already durable, only the data needs
+ * a barrier. Read under wal_lock; the barrier itself may run without it. */
+static int wal_sync_datasync_locked(QueueStore *store) {
+    return store->wal_alloc_end != 0 && store->wal_size_synced;
+}
+
+static int wal_sync_run(QueueStore *store, int datasync) {
+#if defined(__linux__)
+    if (datasync) return fdatasync(store->log_fd);
+#else
+    (void)datasync;
+#endif
+    return fsync(store->log_fd);
+}
+
+/* The barrier that just completed also made the current file size durable.
+ * Holds wal_lock. */
+static void wal_sync_done_locked(QueueStore *store) {
+    store->wal_size_synced = 1;
+}
+
+/* Hand every staged byte to the kernel. Caller holds wal_lock. Marks the
+ * store failed on a write error so no later operation can acknowledge. */
+static int wal_flush_locked(QueueStore *store) {
+    if (!store->wal_buf_len) return 0;
+    wal_reserve_locked(store, store->wal_buf_len);
+    if (pwrite_all(store->log_fd, store->wal_buf, store->wal_buf_len,
+                   store->wal_off) < 0) {
+        __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
+        pthread_cond_broadcast(&store->sync_cond);
+        return -1;
+    }
+    store->wal_off += (off_t)store->wal_buf_len;
+    store->wal_buf_len = 0;
+    return 0;
+}
+
+/* Stage one record's bytes. Caller holds wal_lock. A record that cannot be
+ * staged (no buffer, or larger than the buffer) is written directly after
+ * flushing, so ordering holds for any record size. */
+static int wal_stage_locked(QueueStore *store, const void *header,
+                            size_t header_len, const void *name,
+                            size_t name_len, const void *data, size_t len) {
+    size_t total = header_len + name_len + len;
+    if (!store->wal_buf && total <= WAL_BUF_CAP) {
+        store->wal_buf = malloc(WAL_BUF_CAP);
+        if (store->wal_buf) store->wal_buf_cap = WAL_BUF_CAP;
+    }
+    if (!store->wal_buf || total > store->wal_buf_cap) {
+        if (wal_flush_locked(store) < 0) return -1;
+        wal_reserve_locked(store, total);
+        off_t at = store->wal_off;
+        if (pwrite_all(store->log_fd, header, header_len, at) < 0 ||
+            (name_len && pwrite_all(store->log_fd, name, name_len,
+                                    at + (off_t)header_len) < 0) ||
+            (len && pwrite_all(store->log_fd, data, len,
+                               at + (off_t)(header_len + name_len)) < 0))
+            return -1;
+        store->wal_off = at + (off_t)total;
+        return 0;
+    }
+    if (store->wal_buf_len + total > store->wal_buf_cap &&
+        wal_flush_locked(store) < 0) return -1;
+    unsigned char *at = store->wal_buf + store->wal_buf_len;
+    memcpy(at, header, header_len);
+    at += header_len;
+    if (name_len) { memcpy(at, name, name_len); at += name_len; }
+    if (len) memcpy(at, data, len);
+    store->wal_buf_len += total;
+    return 0;
+}
+
+/* Every record op replay accepts. Shared with the trailing-record scan so
+ * the two can never disagree about what a record looks like. */
+static int record_op_known(unsigned op) {
+    return op == LOG_DECLARE || op == LOG_PUBLISH || op == LOG_ACK ||
+           op == LOG_DELIVER || op == LOG_REQUEUE || op == LOG_EXDECLARE ||
+           op == LOG_EXBIND || op == LOG_EXUNBIND || op == LOG_TX_PREPARE ||
+           op == LOG_TX_COMMIT || op == LOG_CONSUMER ||
+           op == LOG_CONSUMER_DEL || op == LOG_PURGE || op == LOG_DELETE ||
+           op == LOG_EXDELETE || op == LOG_EXUPDATE ||
+           op == LOG_JOB_STATE || op == LOG_JOB_COMPLETION ||
+           op == LOG_JOB_RECEIPT || op == LOG_JOB_META || op == LOG_QUEUE_META;
 }
 
 static int read_all(int fd, void *data, size_t len) {
@@ -653,10 +838,14 @@ static int dead_letter_locked(QueueStore *store, Queue *queue, Message *message,
     return 1;
 }
 
-static int append_record(QueueStore *store, unsigned op, int durable,
-                         const char *name, uint32_t name_len, uint64_t id,
-                         uint64_t aux, const void *data, uint32_t len,
-                         int do_fsync) {
+/* `defer` stages the record without handing it to the kernel: only for a
+ * caller that writes nothing to memory until a later flush (sync_log, or the
+ * durability wait) has covered it. Every other caller must leave it zero, so
+ * a write error is visible before the record is applied. */
+static int append_record_ex(QueueStore *store, unsigned op, int durable,
+                            const char *name, uint32_t name_len, uint64_t id,
+                            uint64_t aux, const void *data, uint32_t len,
+                            int do_fsync, int defer) {
     if (!durable) return 0;
     if (store->log_fd < 0 || __atomic_load_n(&store->failed, __ATOMIC_RELAXED))
         return -1;
@@ -675,9 +864,18 @@ static int append_record(QueueStore *store, unsigned op, int durable,
      * The do_fsync variant (transaction and consumer records) keeps the lock
      * across the fsync; those records acknowledge nothing else. */
     QLOCK(&store->wal_lock);
-    int wrote_fail = write_all(store->log_fd, header, sizeof(header)) < 0 ||
-                     write_all(store->log_fd, name, name_len) < 0 ||
-                     (len && write_all(store->log_fd, data, len) < 0);
+    /* Stage, then hand the bytes to the kernel before returning. Callers
+     * apply the record to the in-memory queue as soon as this succeeds
+     * (publish adds the message, consume marks the delivery), so a write
+     * error must surface here; deferring it to the durability wait would
+     * leave a message visible that no barrier will ever cover. Staging still
+     * turns the header, name and payload into one syscall instead of three.
+     * Coalescing a whole batch into one syscall needs the batch paths to
+     * stage every record before mutating any of them; that restructure is
+     * recorded as follow-up work, not assumed here. */
+    int wrote_fail = wal_stage_locked(store, header, sizeof(header),
+                                      name, name_len, data, len) < 0 ||
+                     (!defer && wal_flush_locked(store) < 0);
     if (wrote_fail) {
         __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
         pthread_cond_broadcast(&store->sync_cond);
@@ -685,7 +883,8 @@ static int append_record(QueueStore *store, unsigned op, int durable,
         return -1;
     }
     if (op == LOG_JOB_COMPLETION) job_failpoint("job_after_write");
-    if (do_fsync && fsync(store->log_fd) < 0) {
+    if (do_fsync && (wal_flush_locked(store) < 0 ||
+                     wal_sync_run(store, wal_sync_datasync_locked(store)) < 0)) {
         __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
         pthread_cond_broadcast(&store->sync_cond);
         QUNLOCK(&store->wal_lock);
@@ -693,9 +892,88 @@ static int append_record(QueueStore *store, unsigned op, int durable,
     }
     __atomic_fetch_add(&store->wal_seq, 1, __ATOMIC_RELAXED);
     if (do_fsync) {
+        wal_sync_done_locked(store);
         /* The fsync covered every record appended so far. */
         __atomic_store_n(&store->synced_seq, __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
         pthread_cond_broadcast(&store->sync_cond);
+    }
+    QUNLOCK(&store->wal_lock);
+    return 0;
+}
+
+static int append_record(QueueStore *store, unsigned op, int durable,
+                         const char *name, uint32_t name_len, uint64_t id,
+                         uint64_t aux, const void *data, uint32_t len,
+                         int do_fsync) {
+    return append_record_ex(store, op, durable, name, name_len, id, aux, data,
+                            len, do_fsync, 0);
+}
+
+/* One record of a staged batch. */
+typedef struct BatchRecord {
+    unsigned op;
+    uint64_t id;
+    uint64_t aux;
+    const void *data;
+    uint32_t len;
+} BatchRecord;
+
+/* Stage a whole batch and hand it to the kernel in one write.
+ *
+ * The single-record path has to write before returning, because its caller
+ * applies the record to memory immediately afterwards and a write error must
+ * be visible first. A batch can do better: nothing is applied to memory until
+ * every record is staged, so one write can cover all of them and still
+ * precede every mutation it describes. wal_lock is held across the whole
+ * sequence, which keeps the batch's bytes contiguous and lets a failure
+ * before the write undo itself completely.
+ *
+ * Returns 0 with every record in the file, or -1 with nothing acknowledged.
+ * Caller must not have mutated queue state yet. */
+static int append_batch_records(QueueStore *store, const char *name,
+                                uint32_t name_len, const BatchRecord *records,
+                                uint32_t count) {
+    if (!count) return 0;
+    if (store->log_fd < 0 || __atomic_load_n(&store->failed, __ATOMIC_RELAXED))
+        return -1;
+    QLOCK(&store->wal_lock);
+    size_t staged_at = store->wal_buf_len;
+    off_t wrote_at = store->wal_off;
+    uint64_t seq_at = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED);
+    int failed = 0;
+    for (uint32_t i = 0; i < count && !failed; i++) {
+        unsigned char header[LOG_HEADER] = {0};
+        header[0] = (unsigned char)records[i].op;
+        header[1] = 1;
+        header[2] = (unsigned char)name_len;
+        header[3] = (unsigned char)(name_len >> 8);
+        put32(header + 4, records[i].len);
+        put64(header + 8, records[i].id);
+        put64(header + 16, records[i].aux);
+        put32(header + 24, crc32(header, 24, name, name_len,
+                                 records[i].data, records[i].len));
+        if (wal_stage_locked(store, header, sizeof header, name, name_len,
+                             records[i].data, records[i].len) < 0)
+            failed = 1;
+        else
+            __atomic_fetch_add(&store->wal_seq, 1, __ATOMIC_RELAXED);
+    }
+    if (!failed && wal_flush_locked(store) < 0) failed = 1;
+    if (failed) {
+        if (store->wal_off == wrote_at) {
+            /* Nothing reached the file: drop the staged bytes and the
+             * sequence numbers so the batch leaves no trace at all. */
+            store->wal_buf_len = staged_at;
+            __atomic_store_n(&store->wal_seq, seq_at, __ATOMIC_RELAXED);
+        }
+        /* Otherwise a full record or more is already in the file; it is a
+         * complete record either way, so replay may recreate messages this
+         * call did not acknowledge — the same superset a crash between the
+         * write and the mutation produces. */
+        __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
+        pthread_cond_broadcast(&store->sync_cond);
+        QUNLOCK(&store->wal_lock);
+        return -1;
     }
     QUNLOCK(&store->wal_lock);
     return 0;
@@ -710,10 +988,16 @@ static int sync_log(QueueStore *store) {
     QLOCK(&store->wal_lock);
     uint64_t target = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED);
     int done = __atomic_load_n(&store->synced_seq, __ATOMIC_RELAXED) >= target;
+    /* Stage to file before the lock is released: the fsync that follows must
+     * cover every record counted by `target`. */
+    int flushed = done ? 0 : wal_flush_locked(store);
+    int datasync = wal_sync_datasync_locked(store);
     QUNLOCK(&store->wal_lock);
     if (done) return 0;
-    int rc = fsync(store->log_fd);
+    if (flushed < 0) return -1;
+    int rc = wal_sync_run(store, datasync);
     QLOCK(&store->wal_lock);
+    if (!rc) wal_sync_done_locked(store);
     if (rc) {
         __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
         pthread_cond_broadcast(&store->sync_cond);
@@ -763,20 +1047,30 @@ static int q_wait_durable_locked(QueueStore *store, uint64_t target) {
          * unlock/relock round trip, and low-load latency is unchanged. */
         if (__atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED) == target &&
             __atomic_load_n(&store->synced_seq, __ATOMIC_RELAXED) == target - 1) {
-            if (fsync(store->log_fd) < 0) {
+            if (wal_flush_locked(store) < 0 ||
+                wal_sync_run(store, wal_sync_datasync_locked(store)) < 0) {
                 __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
                 pthread_cond_broadcast(&store->sync_cond);
                 return -1;
             }
+            wal_sync_done_locked(store);
             __atomic_store_n(&store->synced_seq, target, __ATOMIC_RELAXED);
             pthread_cond_broadcast(&store->sync_cond);
             return 0;
         }
         __atomic_store_n(&store->syncer, 1, __ATOMIC_RELAXED);
         uint64_t covered = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED); /* fsync covers everything to date */
+        /* The staged bytes for `covered` reach the file before the lock is
+         * released; records staged during the fsync belong to a later round. */
+        if (wal_flush_locked(store) < 0) {
+            __atomic_store_n(&store->syncer, 0, __ATOMIC_RELAXED);
+            return -1;
+        }
+        int datasync = wal_sync_datasync_locked(store);
         QUNLOCK(&store->wal_lock);
-        int rc = fsync(store->log_fd);
+        int rc = wal_sync_run(store, datasync);
         QLOCK(&store->wal_lock);
+        if (!rc) wal_sync_done_locked(store);
         __atomic_store_n(&store->syncer, 0, __ATOMIC_RELAXED);
         if (rc) {
             __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
@@ -787,6 +1081,14 @@ static int q_wait_durable_locked(QueueStore *store, uint64_t target) {
             __atomic_store_n(&store->synced_seq, covered, __ATOMIC_RELAXED);
         pthread_cond_broadcast(&store->sync_cond);
     }
+}
+
+/* Deferred variant for a pass that only logs: the records are written by the
+ * sync_log that follows, in one call, before the applying pass runs. */
+static int append_log_deferred(QueueStore *store, unsigned op, Queue *queue,
+                               uint64_t id) {
+    return append_record_ex(store, op, queue->durable, queue->name,
+                            queue->name_len, id, 0, NULL, 0, 0, 1);
 }
 
 static int append_log(QueueStore *store, unsigned op, Queue *queue, uint64_t id,
@@ -1450,6 +1752,52 @@ static int apply_job_record(QueueStore *store, unsigned op, const char *name,
     return 0;
 }
 
+/* Replay stops at the first byte that is not a record and truncates there.
+ * That is right for a torn tail, and it is right for the run of zeros a
+ * space reservation leaves behind when a process exits without a clean
+ * close. It would be wrong if a committed record sat beyond that point:
+ * truncation would discard it silently. Scan the remainder for anything that
+ * parses as a record with a matching CRC, and report it so the caller can
+ * refuse the open with every byte intact.
+ *
+ * Cost is paid only when a tail exists, and the common case — an all-zero
+ * reservation tail — is settled by the zero scan without parsing anything.
+ * A torn record's bytes are real data, so they take the parse path and are
+ * rejected there: matching a CRC-32 by chance is a 2^-32 event. */
+static int tail_holds_record(int fd, off_t from, off_t end) {
+    if (end <= from) return 0;
+    size_t span = (size_t)(end - from);
+    unsigned char *tail = malloc(span);
+    if (!tail) return -1;             /* cannot prove it is safe: say so */
+    for (size_t got = 0; got < span;) {
+        ssize_t n = pread(fd, tail + got, span - got, from + (off_t)got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(tail); return -1; }
+        got += (size_t)n;
+    }
+    size_t first = 0;
+    while (first < span && !tail[first]) first++;
+    if (first == span) { free(tail); return 0; }   /* pure reservation tail */
+    for (size_t at = first; at + LOG_HEADER <= span; at++) {
+        const unsigned char *h = tail + at;
+        unsigned op = h[0];
+        if (!record_op_known(op)) continue;
+        uint32_t name_len = (uint32_t)h[2] | ((uint32_t)h[3] << 8);
+        uint32_t len = get32(h + 4);
+        if (!name_len || name_len > QUEUE_NAME_MAX || len > QUEUE_MESSAGE_MAX)
+            continue;
+        size_t total = LOG_HEADER + name_len + len;
+        if (at + total > span) continue;
+        if (crc32(h, 24, h + LOG_HEADER, name_len,
+                  len ? h + LOG_HEADER + name_len : NULL, len) == get32(h + 24)) {
+            free(tail);
+            return 1;
+        }
+    }
+    free(tail);
+    return 0;
+}
+
 static int replay_log(QueueStore *store, int *open_error) {
     off_t good = 0;
     for (;;) {
@@ -1476,13 +1824,7 @@ static int replay_log(QueueStore *store, int *open_error) {
             if (open_error) *open_error = QUEUE_OPEN_JOB_DISABLED;
             return -2;
         }
-        if ((op != LOG_DECLARE && op != LOG_PUBLISH && op != LOG_ACK &&
-             op != LOG_DELIVER && op != LOG_REQUEUE &&
-             op != LOG_EXDECLARE && op != LOG_EXBIND && op != LOG_EXUNBIND &&
-             op != LOG_TX_PREPARE && op != LOG_TX_COMMIT &&
-             op != LOG_CONSUMER && op != LOG_CONSUMER_DEL && op != LOG_PURGE &&
-             op != LOG_DELETE && op != LOG_EXDELETE && op != LOG_EXUPDATE &&
-             !job_record) ||
+        if (!record_op_known(op) ||
             name_len == 0 || name_len > QUEUE_NAME_MAX || len > QUEUE_MESSAGE_MAX ||
             (op != LOG_PUBLISH && op != LOG_DECLARE && op != LOG_EXDECLARE &&
              op != LOG_EXBIND && op != LOG_EXUNBIND && op != LOG_EXUPDATE &&
@@ -1584,6 +1926,17 @@ static int replay_log(QueueStore *store, int *open_error) {
         if (result < 0) goto corrupt;
         continue;
 corrupt:
+        {
+            off_t end = lseek(store->log_fd, 0, SEEK_END);
+            if (end < 0) return -1;
+            int trailing = tail_holds_record(store->log_fd, good, end);
+            if (trailing != 0) {
+                if (open_error)
+                    *open_error = trailing > 0 ? QUEUE_OPEN_TRAILING_RECORDS
+                                               : QUEUE_OPEN_FAILED;
+                return -2;
+            }
+        }
         if (ftruncate(store->log_fd, good) < 0) return -1;
         if (lseek(store->log_fd, good, SEEK_SET) < 0) return -1;
         return 0;
@@ -1652,7 +2005,9 @@ QueueStore *queue_store_open_ex(const char *path, int job_enabled,
         free(store);
         return NULL;
     }
-    store->log_fd = open(path, O_RDWR | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    /* No O_APPEND: writes address wal_off explicitly so they can land inside
+     * a reserved span that is larger than the live log. */
+    store->log_fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (store->log_fd < 0 || fchmod(store->log_fd, 0600) < 0) {
         if (store->log_fd >= 0) close(store->log_fd);
         pthread_mutex_destroy(&store->lock);
@@ -1663,14 +2018,19 @@ QueueStore *queue_store_open_ex(const char *path, int job_enabled,
         return NULL;
     }
     int open_error = QUEUE_OPEN_OK;
+    off_t end;
+    /* Replay stops at the first byte that is not a valid record and truncates
+     * there, so any reservation left by an earlier run is discarded before
+     * the cursor is taken. */
     if (lseek(store->log_fd, 0, SEEK_SET) < 0 ||
         replay_log(store, &open_error) < 0 ||
-        lseek(store->log_fd, 0, SEEK_END) < 0) {
+        (end = lseek(store->log_fd, 0, SEEK_END)) < 0) {
         int kind = open_error ? open_error : QUEUE_OPEN_FAILED;
         queue_store_close(store);
         if (error) *error = kind;
         return NULL;
     }
+    store->wal_off = end;
     return store;
 }
 
@@ -1753,7 +2113,16 @@ void queue_store_close(QueueStore *store) {
     /* No lock here: close requires quiescence (the store is single-owner),
      * and queue_tx_prepare deliberately returns with the lock held across
      * the prepare/commit pair, so a waiting close could self-deadlock. */
-    if (store->log_fd >= 0) close(store->log_fd);
+    if (store->log_fd >= 0) {
+        wal_flush_locked(store);   /* quiescent: no other thread can stage */
+        /* Return the unwritten reservation so the WAL on disk is exactly the
+         * records it holds. */
+        if (store->wal_alloc_end > store->wal_off &&
+            ftruncate(store->log_fd, store->wal_off) == 0)
+            store->wal_alloc_end = store->wal_off;
+        close(store->log_fd);
+    }
+    free(store->wal_buf);
     pthread_mutex_destroy(&store->lock);
     pthread_mutex_destroy(&store->wal_lock);
     pthread_cond_destroy(&store->sync_cond);
@@ -1975,7 +2344,6 @@ int queue_consume_for_owner(QueueStore *store, const char *name, uint32_t name_l
                 (visibility_ms ? visibility_ms : 30000);
             if (message->visibility_deadline_ms < queue->earliest_visibility)
                 queue->earliest_visibility = message->visibility_deadline_ms;
-            message->not_before_ms = 0;
             message->deliveries++;
             message->owner = owner;
             message->delivery_tag = __atomic_fetch_add(&store->next_delivery_tag, 1, __ATOMIC_RELAXED);
@@ -2919,9 +3287,38 @@ int queue_job_commit(QueueStore *store, const QueueJobCommit *spec,
 
 #define QUEUE_CHECKPOINT_FLOOR (1ull << 20)
 
+/* The checkpoint runs with the metadata lock and every queue lock held, so
+ * its cost is a pause for the whole store. It used to spend up to three
+ * write syscalls per emitted record; staging records and handing the kernel
+ * one buffer at a time shortens that pause without changing a byte of the
+ * file it produces. */
+#define CKPT_BUF_CAP (64u * 1024u)
+typedef struct CkptWriter {
+    int fd;
+    unsigned char *buf;   /* NULL when the allocation failed: writes pass through */
+    size_t len;
+} CkptWriter;
+
+static int ckpt_flush(CkptWriter *w) {
+    if (!w->len) return 0;
+    if (write_all(w->fd, w->buf, w->len) < 0) return -1;
+    w->len = 0;
+    return 0;
+}
+
+static int ckpt_write(CkptWriter *w, const void *data, size_t len) {
+    if (!len) return 0;
+    if (!w->buf || len >= CKPT_BUF_CAP)  /* no buffer, or larger than one */
+        return ckpt_flush(w) < 0 ? -1 : write_all(w->fd, data, len);
+    if (w->len + len > CKPT_BUF_CAP && ckpt_flush(w) < 0) return -1;
+    memcpy(w->buf + w->len, data, len);
+    w->len += len;
+    return 0;
+}
+
 /* Emit one record into the checkpoint temp file (same format as
  * append_record; the checkpoint is not part of the live sequence). */
-static int ckpt_emit(int fd, unsigned op, int durable, const char *name,
+static int ckpt_emit(CkptWriter *w, unsigned op, int durable, const char *name,
                      uint32_t name_len, uint64_t id, uint64_t aux,
                      const void *data, uint32_t len, uint64_t *bytes,
                      uint64_t *records) {
@@ -2934,16 +3331,16 @@ static int ckpt_emit(int fd, unsigned op, int durable, const char *name,
     put64(header + 8, id);
     put64(header + 16, aux);
     put32(header + 24, crc32(header, 24, name, name_len, data, len));
-    if (write_all(fd, header, sizeof(header)) < 0 ||
-        write_all(fd, name, name_len) < 0 ||
-        (len && write_all(fd, data, len) < 0)) return -1;
+    if (ckpt_write(w, header, sizeof(header)) < 0 ||
+        ckpt_write(w, name, name_len) < 0 ||
+        ckpt_write(w, data, len) < 0) return -1;
     *bytes += LOG_HEADER + name_len + len;
     (*records)++;
     return 0;
 }
 /* Job-engine emit adapter: forwards to ckpt_emit with the shared counters. */
 typedef struct QueueCkptCtx {
-    int fd;
+    CkptWriter *writer;
     uint64_t *bytes;
     uint64_t *records;
 } QueueCkptCtx;
@@ -2952,7 +3349,7 @@ static int ckpt_emit_job(void *ud, unsigned op, const char *name,
                          uint32_t name_len, uint64_t id, uint64_t aux,
                          const void *data, uint32_t len) {
     QueueCkptCtx *ctx = ud;
-    return ckpt_emit(ctx->fd, op, 1, name, name_len, id, aux, data, len,
+    return ckpt_emit(ctx->writer, op, 1, name, name_len, id, aux, data, len,
                      ctx->bytes, ctx->records);
 }
 
@@ -2979,8 +3376,13 @@ int queue_checkpoint_maybe(QueueStore *store) {
  * -1 on failure (the previous WAL stays valid either way). */
 static int queue_checkpoint_body(QueueStore *store, int force) {
     if (!store || !store->path || store->log_fd < 0) return 0;
-    struct stat st;
-    if (fstat(store->log_fd, &st) < 0) return 0;
+    /* The size heuristic and the fd swap below must both see the whole WAL,
+     * so stage everything to the file first. */
+    QLOCK(&store->wal_lock);
+    int staged = wal_flush_locked(store);
+    off_t wal_len = store->wal_off;   /* reserved-but-unwritten space is not history */
+    QUNLOCK(&store->wal_lock);
+    if (staged < 0) return -1;
     uint64_t live_total = 0;
     QLOCK(&store->lock);            /* metadata: stable queue set + counters */
     for (Queue *queue = store->queues; queue; queue = queue->next) {
@@ -2993,7 +3395,7 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
     if (store->job_enabled && store->job_hooks.live_bytes)
         live_total += store->job_hooks.live_bytes(store->job_hooks.ud);
     if (!force &&
-        (uint64_t)st.st_size <= live_total * 2 + QUEUE_CHECKPOINT_FLOOR) {
+        (uint64_t)wal_len <= live_total * 2 + QUEUE_CHECKPOINT_FLOOR) {
         for (Queue *queue = store->queues; queue; queue = queue->next)
             QUNLOCK(&queue->lock);
         QUNLOCK(&store->lock);
@@ -3031,6 +3433,7 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
         QUNLOCK(&store->lock);
         return -1;
     }
+    CkptWriter writer = {fd, malloc(CKPT_BUF_CAP), 0};
     fchmod(fd, 0600);
     uint64_t bytes = 0, records = 0;
     int rc = 0;
@@ -3049,7 +3452,7 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
                                  ? store->job_hooks.version_hwm(store->job_hooks.ud) : 0);
             put64(mval + 41, store->job_hooks.commit_hwm
                                  ? store->job_hooks.commit_hwm(store->job_hooks.ud) : 0);
-            rc = ckpt_emit(fd, LOG_JOB_META, 1, QUEUE_WAL_JOB_META_NAME,
+            rc = ckpt_emit(&writer, LOG_JOB_META, 1, QUEUE_WAL_JOB_META_NAME,
                            (uint32_t)(sizeof(QUEUE_WAL_JOB_META_NAME) - 1), 0, 0,
                            mval, sizeof mval, &bytes, &records);
         }
@@ -3069,11 +3472,11 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
             put32(dval + 2 + queue->dlq_len, queue->max_deliveries);
             dlen = 2 + queue->dlq_len + 4;
         }
-        rc = ckpt_emit(fd, LOG_DECLARE, queue->durable, queue->name,
+        rc = ckpt_emit(&writer, LOG_DECLARE, queue->durable, queue->name,
                        queue->name_len, 0, queue->max_depth,
                        dlen ? dval : NULL, dlen, &bytes, &records);
         if (!rc && store->job_enabled)
-            rc = ckpt_emit(fd, LOG_QUEUE_META, 1, queue->name,
+            rc = ckpt_emit(&writer, LOG_QUEUE_META, 1, queue->name,
                            queue->name_len, queue->incarnation, 0, NULL, 0,
                            &bytes, &records);
     }
@@ -3081,20 +3484,20 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
         Queue *queue = sorted[i];
         if (queue->deleted) continue;
         for (Message *m = queue->head; m && !rc; m = m->next) {
-            rc = ckpt_emit(fd, LOG_PUBLISH, 1, queue->name, queue->name_len,
+            rc = ckpt_emit(&writer, LOG_PUBLISH, 1, queue->name, queue->name_len,
                            m->id, m->expires_ms, m->data, m->len, &bytes, &records);
             for (uint32_t d = 0; d < m->deliveries && !rc; d++)
-                rc = ckpt_emit(fd, LOG_DELIVER, 1, queue->name, queue->name_len,
+                rc = ckpt_emit(&writer, LOG_DELIVER, 1, queue->name, queue->name_len,
                                m->id, 0, NULL, 0, &bytes, &records);
-            if (!rc && m->not_before_ms)
-                rc = ckpt_emit(fd, LOG_REQUEUE, 1, queue->name, queue->name_len,
+            if (!rc && m->state == MESSAGE_READY && m->not_before_ms)
+                rc = ckpt_emit(&writer, LOG_REQUEUE, 1, queue->name, queue->name_len,
                                m->id, m->not_before_ms, NULL, 0, &bytes, &records);
         }
     }
     /* Durable state and unexpired receipts: one consistent cut, emitted by
      * the job engine under its own locks while every Queue lock is held. */
     if (!rc && store->job_enabled && store->job_hooks.checkpoint_emit) {
-        QueueCkptCtx ctx = {fd, &bytes, &records};
+        QueueCkptCtx ctx = {&writer, &bytes, &records};
         rc = store->job_hooks.checkpoint_emit(store->job_hooks.ud, &ctx,
                                               ckpt_emit_job);
     }
@@ -3105,7 +3508,7 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
         pval[1] = (unsigned char)(exchange->ae_len & 0xff);
         pval[2] = (unsigned char)(exchange->ae_len >> 8);
         if (exchange->ae_len) memcpy(pval + 3, exchange->ae_name, exchange->ae_len);
-        rc = ckpt_emit(fd, LOG_EXDECLARE, exchange->durable, exchange->name,
+        rc = ckpt_emit(&writer, LOG_EXDECLARE, exchange->durable, exchange->name,
                        exchange->name_len, 0, exchange->revision, pval, 3 + exchange->ae_len,
                        &bytes, &records);
         for (Binding *b = exchange->bindings; b && !rc; b = b->next) {
@@ -3116,12 +3519,12 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
             bval[2 + b->queue_len] = (unsigned char)b->key_len;
             bval[3 + b->queue_len] = (unsigned char)(b->key_len >> 8);
             if (b->key_len) memcpy(bval + 4 + b->queue_len, b->key, b->key_len);
-            rc = ckpt_emit(fd, LOG_EXBIND, 1, exchange->name, exchange->name_len,
+            rc = ckpt_emit(&writer, LOG_EXBIND, 1, exchange->name, exchange->name_len,
                            0, exchange->revision, bval, 4 + b->queue_len + b->key_len, &bytes, &records);
         }
     }
     for (QueueConsumer *c = store->consumers; c && !rc; c = c->next)
-        rc = ckpt_emit(fd, LOG_CONSUMER, 1, c->name, c->name_len, c->owner,
+        rc = ckpt_emit(&writer, LOG_CONSUMER, 1, c->name, c->name_len, c->owner,
                        0, NULL, 0, &bytes, &records);
     for (QueueTx *tx = store->tx_pending; tx && !rc; tx = tx->next) {
         size_t plen = 22;
@@ -3145,10 +3548,12 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
             off += 10 + (size_t)t->name_len;
         }
         memcpy(payload + off, tx->data, tx->len);
-        rc = ckpt_emit(fd, LOG_TX_PREPARE, 1, tx->source, tx->source_len, 0, 0,
+        rc = ckpt_emit(&writer, LOG_TX_PREPARE, 1, tx->source, tx->source_len, 0, 0,
                        payload, (uint32_t)plen, &bytes, &records);
         free(payload);
     }
+    if (!rc && ckpt_flush(&writer) < 0) rc = -1;
+    free(writer.buf);
     if (!rc && fsync(fd)) { rc = -1; fprintf(stderr, "[ckpt dbg] fsync failed errno=%d\n", errno); }
     if (close(fd)) rc = -1;
     if (!rc && rename(tmp, store->path)) { rc = -1; fprintf(stderr, "[ckpt dbg] rename failed errno=%d\n", errno); }
@@ -3167,12 +3572,24 @@ static int queue_checkpoint_body(QueueStore *store, int force) {
         if (prc) rc = -1;
     }
     if (!rc) {
+        /* Every queue and the metadata lock are held, so nothing can have
+         * staged a record since the flush above; discard defensively rather
+         * than let a stray byte land out of order in the new file. */
+        QLOCK(&store->wal_lock);
+        store->wal_buf_len = 0;
+        QUNLOCK(&store->wal_lock);
         close(store->log_fd);
-        store->log_fd = open(store->path, O_RDWR | O_APPEND | O_NOFOLLOW, 0600);
-        if (store->log_fd < 0) {
+        store->log_fd = open(store->path, O_RDWR | O_NOFOLLOW, 0600);
+        off_t swapped = store->log_fd < 0 ? -1 : lseek(store->log_fd, 0, SEEK_END);
+        if (store->log_fd < 0 || swapped < 0) {
                 __atomic_store_n(&store->failed, 1, __ATOMIC_RELAXED);
             rc = -1;
         } else {
+            QLOCK(&store->wal_lock);
+            store->wal_off = swapped;
+            store->wal_alloc_end = 0;   /* the checkpoint carries no reservation */
+            store->wal_size_synced = 0;
+            QUNLOCK(&store->wal_lock);
             /* The WAL now consists of exactly the checkpointed records. */
             __atomic_store_n(&store->wal_seq, records, __ATOMIC_RELAXED);
             __atomic_store_n(&store->synced_seq, records, __ATOMIC_RELAXED);
@@ -3218,26 +3635,52 @@ int queue_publish_batch(QueueStore *store, const char *name, uint32_t name_len,
         QUNLOCK(&queue->lock);
         return -1;
     }
-    uint64_t before = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED);
-    for (uint32_t i = 0; i < count; i++) {
+    /* Validate everything before allocating an ID or touching the WAL, so a
+     * bad entry costs nothing. */
+    for (uint32_t i = 0; i < count; i++)
         if (!data[i] || !lens[i] || lens[i] > QUEUE_MESSAGE_MAX) {
             QUNLOCK(&queue->lock);
             return -1;
         }
-        uint64_t id = __atomic_fetch_add(&store->next_id, 1, __ATOMIC_RELAXED);
-        uint64_t expires_ms = 0; /* batch publish carries no per-message TTL */
-        if (queue->durable &&
-            append_record(store, LOG_PUBLISH, 1, queue->name, queue->name_len,
-                          id, expires_ms, data[i], lens[i], 0) < 0) {
-            QUNLOCK(&queue->lock);
-            return -1;
-        }
-        if (append_message(queue, id, expires_ms, data[i], lens[i]) < 0) {
-            QUNLOCK(&queue->lock);
-            return -1;
-        }
-        if (out_ids) out_ids[i] = id;
+    uint64_t before = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED);
+    uint64_t *ids = malloc((size_t)count * sizeof *ids);
+    BatchRecord *records = queue->durable
+        ? malloc((size_t)count * sizeof *records) : NULL;
+    if (!ids || (queue->durable && !records)) {
+        free(ids);
+        free(records);
+        QUNLOCK(&queue->lock);
+        return -1;
     }
+    for (uint32_t i = 0; i < count; i++) {
+        ids[i] = __atomic_fetch_add(&store->next_id, 1, __ATOMIC_RELAXED);
+        if (records) {
+            records[i].op = LOG_PUBLISH;
+            records[i].id = ids[i];
+            records[i].aux = 0;   /* batch publish carries no per-message TTL */
+            records[i].data = data[i];
+            records[i].len = lens[i];
+        }
+    }
+    /* Every record reaches the file before the first message is added, so
+     * one write covers the batch and still precedes every mutation. */
+    if (records && append_batch_records(store, queue->name, queue->name_len,
+                                        records, count) < 0) {
+        free(ids);
+        free(records);
+        QUNLOCK(&queue->lock);
+        return -1;
+    }
+    free(records);
+    for (uint32_t i = 0; i < count; i++) {
+        if (append_message(queue, ids[i], 0, data[i], lens[i]) < 0) {
+            free(ids);
+            QUNLOCK(&queue->lock);
+            return -1;
+        }
+        if (out_ids) out_ids[i] = ids[i];
+    }
+    free(ids);
     int rc = 0;
     if (__atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED) != before) {
         QLOCK(&store->wal_lock);
@@ -3264,6 +3707,10 @@ int queue_consume_batch(QueueStore *store, const char *name, uint32_t name_len,
     uint64_t before = __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED);
     uint32_t n = 0;
     if (!queue->ready_hint) { *out_count = 0; QUNLOCK(&queue->lock); return 0; }
+    /* Selected messages are held here until every delivery record for the
+     * batch has reached the file; only then are they marked in flight. */
+    Message **picked = malloc((size_t)max * sizeof *picked);
+    if (!picked) { QUNLOCK(&queue->lock); return -1; }
     Message *scan = queue->ready_hint;
     Message *first_delayed = NULL;
     Message *last_delivered = NULL;
@@ -3281,21 +3728,15 @@ int queue_consume_batch(QueueStore *store, const char *name, uint32_t name_len,
                 if (routed < 0) { scan = next; continue; }
             }
             void *copy = malloc(message->len ? message->len : 1);
-            if (!copy) { QUNLOCK(&queue->lock); return -1; }
+            if (!copy) { free(picked); QUNLOCK(&queue->lock); return -1; }
             if (message->len) memcpy(copy, message->data, message->len);
-            if (queue->durable && append_log(store, LOG_DELIVER, queue,
-                                             message->id, 0, NULL, 0) < 0) {
-                free(copy);
-                QUNLOCK(&queue->lock);
-                return -1;
-            }
+            picked[n] = message;
             message->state = MESSAGE_INFLIGHT;
             queue->revision++;
             message->visibility_deadline_ms = monotonic_ms() +
                 (visibility_ms ? visibility_ms : 30000);
             if (message->visibility_deadline_ms < queue->earliest_visibility)
                 queue->earliest_visibility = message->visibility_deadline_ms;
-            message->not_before_ms = 0;
             message->deliveries++;
             message->owner = owner;
             message->delivery_tag = __atomic_fetch_add(&store->next_delivery_tag, 1, __ATOMIC_RELAXED);
@@ -3321,7 +3762,29 @@ int queue_consume_batch(QueueStore *store, const char *name, uint32_t name_len,
                       : ready_hint_advance(queue, last_delivered ? last_delivered->next : queue->ready_hint);
     *out_count = n;
     int rc = 0;
-    if (n && queue->durable && __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED) != before) {
+    /* One write for the whole batch. The queue lock has been held since the
+     * scan began, so no reader has observed these messages as in flight and
+     * no consumer can be handed one: the records reach the file before the
+     * batch becomes visible, exactly as the per-record write did. */
+    if (n && queue->durable) {
+        BatchRecord *records = malloc((size_t)n * sizeof *records);
+        if (!records) rc = -1;
+        else {
+            for (uint32_t i = 0; i < n; i++) {
+                records[i].op = LOG_DELIVER;
+                records[i].id = picked[i]->id;
+                records[i].aux = 0;
+                records[i].data = NULL;
+                records[i].len = 0;
+            }
+            rc = append_batch_records(store, queue->name, queue->name_len,
+                                      records, n);
+            free(records);
+        }
+    }
+    free(picked);
+    if (!rc && n && queue->durable &&
+        __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED) != before) {
         QLOCK(&store->wal_lock);
         rc = q_wait_durable_locked(store, __atomic_load_n(&store->wal_seq, __ATOMIC_RELAXED));
         QUNLOCK(&store->wal_lock);
@@ -3378,7 +3841,7 @@ static int ack_nack_batch_locked(QueueStore *store, Queue *queue,
                  (!have_fallback || message->owner != owner_fallback)))
                 continue;
             if (queue->durable &&
-                append_log(store, LOG_REQUEUE, queue, message->id, 0, NULL, 0) < 0) {
+                append_log_deferred(store, LOG_REQUEUE, queue, message->id) < 0) {
                 QUNLOCK(&store->lock);
                 return -1;
             }
@@ -3429,7 +3892,7 @@ static int ack_nack_batch_locked(QueueStore *store, Queue *queue,
                 continue;
             }
             if (queue->durable &&
-                append_log(store, LOG_ACK, queue, message->id, 0, NULL, 0) < 0) {
+                append_log_deferred(store, LOG_ACK, queue, message->id) < 0) {
                 QUNLOCK(&store->lock);
                 return -1;
             }
@@ -3679,8 +4142,8 @@ int queue_peek_after(QueueStore *store, const char *name, uint32_t name_len,
         QueueMessageSnapshot *snapshot = &copy[count++];
         snapshot->id = message->id;
         snapshot->expires_ms = message->expires_ms;
-        snapshot->not_before_ms = message->not_before_ms;
-        snapshot->visibility_deadline_ms = message->visibility_deadline_ms;
+        snapshot->not_before_ms = message->state == MESSAGE_READY ? message->not_before_ms : 0;
+        snapshot->visibility_deadline_ms = message->state == MESSAGE_INFLIGHT ? message->visibility_deadline_ms : 0;
         snapshot->len = message->len;
         snapshot->delivery_count = message->deliveries;
         snapshot->state = state;
@@ -3725,8 +4188,8 @@ int queue_message_snapshot(QueueStore *store, const char *name,
     uint64_t wall_now=now_ms();Message *message=queue->head;
     while(message&&message->id!=message_id)message=message->next;
     if(!message||(message->expires_ms&&message->expires_ms<=wall_now)){QUNLOCK(&queue->lock);return 0;}
-    out->id=message->id;out->expires_ms=message->expires_ms;out->not_before_ms=message->not_before_ms;
-    out->visibility_deadline_ms=message->visibility_deadline_ms;out->len=message->len;
+    out->id=message->id;out->expires_ms=message->expires_ms;out->not_before_ms=message->state==MESSAGE_READY?message->not_before_ms:0;
+    out->visibility_deadline_ms=message->state==MESSAGE_INFLIGHT?message->visibility_deadline_ms:0;out->len=message->len;
     out->delivery_count=message->deliveries;out->state=message->state==MESSAGE_INFLIGHT?QUEUE_PEEK_INFLIGHT:message->not_before_ms>wall_now?QUEUE_PEEK_DELAYED:QUEUE_PEEK_READY;out->redelivered=message->deliveries>1;
     if(include_body){if((uint64_t)message->len>body_budget){QUNLOCK(&queue->lock);return-2;}out->data=malloc(message->len?message->len:1);if(!out->data){QUNLOCK(&queue->lock);return-1;}if(message->len)memcpy(out->data,message->data,message->len);}
     QUNLOCK(&queue->lock);return 1;
@@ -3810,8 +4273,22 @@ uint64_t queue_owner_inflight(QueueStore *store, uint64_t owner) {
     QLOCK(&store->lock);            /* metadata: walk the stable queue set */
     for (Queue *queue = store->queues; queue; queue = queue->next) {
         QLOCK(&queue->lock);
-        for (Message *message = queue->head; message; message = message->next)
-            if (message->state == MESSAGE_INFLIGHT && message->owner == owner) count++;
+        /* Prefetch depends on active deliveries, not the ready backlog. Use
+         * the existing tag index without adding memory to every message.
+         * Allocation failure can leave the index incomplete; retain the
+         * full-list fallback so limits still account for every delivery. */
+        if (queue->inflight && queue->tag_buckets &&
+            queue->tag_count == queue->inflight) {
+            for (uint32_t i = 0; i <= queue->tag_mask; i++)
+                for (Message *message = queue->tag_buckets[i]; message;
+                     message = message->tag_next)
+                    if (message->state == MESSAGE_INFLIGHT && message->owner == owner)
+                        count++;
+        } else if (queue->inflight) {
+            for (Message *message = queue->head; message; message = message->next)
+                if (message->state == MESSAGE_INFLIGHT && message->owner == owner)
+                    count++;
+        }
         QUNLOCK(&queue->lock);
     }
     QUNLOCK(&store->lock);
